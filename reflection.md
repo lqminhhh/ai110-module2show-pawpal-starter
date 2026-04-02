@@ -4,8 +4,49 @@
 
 **a. Initial design**
 
-- Briefly describe your initial UML design.
-- What classes did you include, and what responsibilities did you assign to each?
+The three core actions a user should be able to perform in PawPal+:
+
+1. **Set up owner and pet info** — The user enters basic details about themselves (name, available time per day) and their pet (name, species, age). This establishes the context the scheduler uses to filter and prioritize tasks.
+
+2. **Add and edit care tasks** — The user creates tasks (e.g., walk, feeding, medication, grooming) with at minimum a duration and a priority level. Tasks can be updated or removed as the pet's needs change.
+
+3. **Generate and view the daily plan** — The user requests a daily schedule. The app produces an ordered plan that fits within the owner's available time, respects task priorities, and displays an explanation of why tasks were chosen or deferred.
+
+**Main objects in the system:**
+
+The system is organized into seven classes across three layers.
+
+**`Priority` (Enum)**
+- Holds: `LOW = 1`, `MEDIUM = 2`, `HIGH = 3`
+- Actions: provides integer values that allow the Planner to sort tasks by urgency without extra mapping
+
+**`Owner`**
+- Holds: `name` (str), `available_minutes` (int, default 120) — the primary capacity constraint
+- Actions: `to_dict()` to serialize for session state; `from_dict()` to reconstruct
+
+**`Pet`**
+- Holds: `name` (str), `species` (str — "dog", "cat", or "other")
+- Actions: `to_dict()` / `from_dict()` for session state
+
+**`Task`**
+- Holds: `title` (str), `duration_minutes` (int ≥ 1), `priority` (Priority), `task_id` (auto-generated UUID)
+- Actions: `is_valid()` to check inputs before adding; `to_dict()` / `from_dict()` for session state
+
+**`ScheduledItem`**
+- Holds: `task` (Task reference), `start_minute` (int), `end_minute` (int, computed), `reason` (str explanation)
+- Actions: `start_time_str()` and `end_time_str()` to convert minutes to readable times; `to_dict()` for display table
+
+**`Schedule`**
+- Holds: `owner`, `pet`, `items` (list of ScheduledItems ordered by start time), `skipped_tasks` (list of Tasks that didn't fit), `total_minutes_scheduled`, `date_label`
+- Actions: `summary()` returns a text explanation of the plan; `to_table_data()` returns a list of dicts for `st.table()`; `skipped_summary()` explains what was left out
+
+**`Planner`**
+- Holds: `owner`, `pet`, `tasks` (candidate pool), `day_start_minute` (default 480 = 8:00 AM)
+- Actions: `set_tasks()` to update the task pool; `_sort_tasks()` (private) sorts by priority then duration; `generate()` runs a greedy algorithm — fits tasks in priority order until time runs out, returns a Schedule
+
+**Class diagram:**
+
+![alt text](image.png)
 
 **b. Design changes**
 
