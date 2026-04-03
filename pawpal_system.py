@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
+from typing import ClassVar
+from datetime import date, timedelta
 from enum import Enum
 
 
@@ -29,13 +31,60 @@ class Task:
     completed: bool = False
     task_id: str = field(default_factory=lambda: str(uuid.uuid4()))
 
+    # Algorithm 3: frequency-aware due date check
+    # Maps each frequency string to the weekday numbers it applies to.
+    # daily → every day; weekly → Monday only (0); as_needed → always included.
+    _FREQUENCY_DAYS: ClassVar[dict] = {
+        "daily": set(range(7)),       # 0=Mon … 6=Sun
+        "weekly": {0},                # Mondays only
+        "as_needed": set(range(7)),   # always eligible
+    }
+
+    def due_today(self, day_of_week: int) -> bool:
+        """
+        Return True if this task should appear in today's schedule.
+
+        day_of_week follows Python's weekday() convention: 0 = Monday, 6 = Sunday.
+        Weekly tasks are only due on Mondays; daily and as_needed tasks are due
+        every day.
+
+        Why: without this check the scheduler would include a 'weekly grooming'
+        task every single day, which defeats the purpose of the frequency field.
+        """
+        eligible_days = self._FREQUENCY_DAYS.get(self.frequency, set(range(7)))
+        return day_of_week in eligible_days
+
     def is_valid(self) -> bool:
         """Return True if the task has a non-empty title and positive duration."""
         return bool(self.title.strip()) and self.duration_minutes >= 1
 
-    def mark_complete(self) -> None:
-        """Mark this task as done for the day."""
+    def mark_complete(self) -> Task | None:
+        """
+        Mark this task as done and, for recurring tasks, return a fresh Task
+        instance representing the next occurrence.
+
+        - daily   → next occurrence is today + 1 day  (uses timedelta(days=1))
+        - weekly  → next occurrence is today + 7 days (uses timedelta(days=7))
+        - as_needed → no automatic recurrence; returns None
+
+        The caller is responsible for adding the returned Task back to the pet.
+        Returning a new object (rather than mutating this one) keeps the
+        completed record intact for history/logging purposes.
+        """
         self.completed = True
+
+        next_deltas = {"daily": timedelta(days=1), "weekly": timedelta(days=7)}
+        delta = next_deltas.get(self.frequency)
+        if delta is None:
+            return None
+
+        return Task(
+            title=self.title,
+            duration_minutes=self.duration_minutes,
+            priority=self.priority,
+            frequency=self.frequency,
+            completed=False,
+        )
 
     def reset(self) -> None:
         """Clear completion status (e.g. at the start of a new day)."""
@@ -132,6 +181,38 @@ class Owner:
     def get_all_pending_tasks(self) -> list[Task]:
         """Return only incomplete tasks across all pets."""
         return [task for pet in self.pets for task in pet.get_pending_tasks()]
+
+    # Algorithm 2a: filter by pet name
+    def get_tasks_for_pet(self, pet_name: str) -> list[Task]:
+        """
+        Return all tasks belonging to the pet with the given name.
+
+        Why: useful for showing a per-pet task list in the UI without
+        exposing the internal pets list to every caller.
+        Comparison is case-insensitive so 'Mochi' and 'mochi' both work.
+        """
+        name = pet_name.strip().lower()
+        for pet in self.pets:
+            if pet.name.lower() == name:
+                return list(pet.tasks)
+        return []
+
+    # Algorithm 2b: filter by completion status across all pets
+    def get_tasks_by_status(self, completed: bool) -> list[Task]:
+        """
+        Return all tasks (across all pets) that match the given completion status.
+
+        get_tasks_by_status(completed=False) → every task still to be done today.
+        get_tasks_by_status(completed=True)  → every task already finished today.
+
+        Why: lets the UI show a 'done' checklist separately from the 'to-do' list.
+        """
+        return [
+            task
+            for pet in self.pets
+            for task in pet.tasks
+            if task.completed == completed
+        ]
 
     def to_dict(self) -> dict:
         return {
@@ -267,16 +348,26 @@ class Scheduler:
         """
         return sorted(tasks, key=lambda t: (-t.priority.value, t.duration_minutes))
 
-    def generate(self) -> Schedule:
+    def generate(self, day_of_week: int | None = None) -> Schedule:
         """
         Build a daily Schedule using a greedy algorithm:
         1. Retrieve all pending tasks via get_all_tasks().
-        2. Sort them by priority (high → low), then duration (short → long).
-        3. Walk the sorted list; fit each task that still has room in the
+        2. Algorithm 3 — filter out tasks not due today using due_today().
+        3. Sort them by priority (high → low), then duration (short → long).
+        4. Walk the sorted list; fit each task that still has room in the
            available time window; skip the rest.
-        4. Return a Schedule with scheduled items and skipped tasks.
+        5. Algorithm 1 — sort output items by start_minute so the table
+           always reads in chronological order.
+        6. Return a Schedule with scheduled items and skipped tasks.
+
+        day_of_week: 0=Monday … 6=Sunday. Defaults to today via date.today().
         """
-        all_tasks = self.get_all_tasks()
+        if day_of_week is None:
+            day_of_week = date.today().weekday()
+
+        # Algorithm 3: drop tasks whose frequency says they aren't due today
+        all_tasks = [t for t in self.get_all_tasks() if t.due_today(day_of_week)]
+
         sorted_tasks = self._prioritize(all_tasks)
 
         items: list[ScheduledItem] = []
@@ -296,7 +387,69 @@ class Scheduler:
             else:
                 skipped.append(task)
 
+        # Algorithm 1: sort scheduled items by start time for clean display
+        items.sort(key=lambda i: i.start_minute)
+
         return Schedule(self.owner, items, skipped)
+
+    def sort_by_time(self, items: list[ScheduledItem]) -> list[ScheduledItem]:
+        """Sort ScheduledItems into chronological order by start time.
+
+        Uses ``sorted()`` with a lambda key on ``start_minute`` (an integer
+        offset from midnight).  Sorting an integer is equivalent to sorting
+        "HH:MM" strings but requires no string parsing or conversion.
+
+        Args:
+            items: A list of ScheduledItem objects in any order.
+
+        Returns:
+            A new list of the same ScheduledItems sorted earliest-first.
+            The original list is not mutated.
+
+        Example::
+
+            sorted_items = scheduler.sort_by_time(schedule.items)
+        """
+        return sorted(items, key=lambda item: item.start_minute)
+
+    def detect_conflicts(self, schedule: Schedule) -> list[str]:
+        """Scan a Schedule for overlapping time windows and return warning messages.
+
+        Two scheduled items conflict when their windows overlap, defined by:
+            ``a.start_minute < b.end_minute  AND  b.start_minute < a.end_minute``
+
+        This covers both partial overlaps (one task starts inside another) and
+        exact-same-start conflicts.
+
+        Lightweight strategy: returns human-readable warning strings rather than
+        raising exceptions, so the caller can display them without crashing the app.
+
+        Args:
+            schedule: The Schedule object whose ``items`` list will be scanned.
+
+        Returns:
+            A list of warning strings, one per conflicting pair.
+            Returns an empty list if the schedule is conflict-free.
+
+        Complexity:
+            O(n²) pairwise comparison — acceptable for the small number of
+            daily care tasks a pet owner would have (typically fewer than 20).
+
+        Example::
+
+            warnings = scheduler.detect_conflicts(schedule)
+            for w in warnings:
+                print(w)
+        """
+        warnings = []
+        for i, a in enumerate(schedule.items):
+            for b in schedule.items[i + 1:]:
+                if a.start_minute < b.end_minute and b.start_minute < a.end_minute:
+                    warnings.append(
+                        f"WARNING: '{a.task.title}' ({a.start_time_str()}–{a.end_time_str()}) "
+                        f"overlaps with '{b.task.title}' ({b.start_time_str()}–{b.end_time_str()})"
+                    )
+        return warnings
 
     @staticmethod
     def _minute_to_time(minute: int) -> str:
